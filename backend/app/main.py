@@ -114,6 +114,26 @@ def get_post(post_id: int):
         if not row: raise HTTPException(404, "Post not found")
         return dict(row)
 
+@app.get("/api/posts")
+def list_posts():
+    with db() as c:
+        rows = c.execute("""
+            SELECT p.id,p.url,p.content,p.author,p.topic,p.score,p.originality,p.usefulness,
+                   p.summary,p.research_context,p.created_at,
+                   s.id AS suggestion_id,s.text AS reply,s.status AS suggestion_status,
+                   EXISTS(SELECT 1 FROM publishing pub
+                          WHERE pub.suggestion_id=s.id AND pub.status='published') AS published
+            FROM posts p
+            LEFT JOIN suggestions s ON s.id=(
+                SELECT latest.id FROM suggestions latest
+                WHERE latest.post_id=p.id
+                ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1
+            )
+            WHERE s.status IS NULL OR s.status!='rejected'
+            ORDER BY p.created_at DESC LIMIT 100
+        """).fetchall()
+        return [dict(row) for row in rows]
+
 @app.post("/api/activity/research")
 def log_context_research(req: ContextResearchEvent):
     with db() as c:

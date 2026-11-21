@@ -22,14 +22,37 @@ function createWindow() {
   xView.webContents.loadURL('https://x.com');
   chatGPTView.webContents.loadURL('about:blank');
   placeView();
-  window.loadURL('http://127.0.0.1:5173');
+  void loadDashboard();
   window.on('resize', placeView);
   window.on('closed', () => { window = null; xView = null; });
+}
+async function loadDashboard() {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    if (!window || window.isDestroyed()) return;
+    try {
+      await Promise.all([
+        fetch('http://127.0.0.1:5173/').then(response => { if (!response.ok) throw new Error('Dashboard is not ready'); }),
+        fetch('http://127.0.0.1:8000/api/health').then(response => { if (!response.ok) throw new Error('API is not ready'); }),
+      ]);
+      await window.loadURL('http://127.0.0.1:5173');
+      return;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  console.error('Could not load the local dashboard at http://127.0.0.1:5173');
 }
 ipcMain.handle('x-browser:toggle', () => {
   activeView = activeView === 'x' ? 'none' : 'x';
   placeView();
   return activeView === 'x';
+});
+ipcMain.handle('x-browser:open', async () => {
+  if (!xView) throw new Error('X browser is not available');
+  activeView = 'x';
+  placeView();
+  if (xView.webContents.getURL() === 'about:blank') await xView.webContents.loadURL('https://x.com');
+  return true;
 });
 ipcMain.handle('x-browser:scan-visible-posts', async () => {
   if (!xView) throw new Error('X browser is not available');
@@ -154,6 +177,49 @@ async function showChatGPT() {
   if (chatGPTView.webContents.getURL() === 'about:blank') await chatGPTView.webContents.loadURL('https://chatgpt.com');
 }
 ipcMain.handle('chatgpt:open', async () => { await showChatGPT(); return true; });
+async function sendChatGPTPrompt(prompt) {
+  if (agentPaused) throw new Error('Agent is paused. Resume it before using ChatGPT.');
+  await showChatGPT();
+  const before = await chatGPTView.webContents.executeJavaScript(`(() => {
+    const box = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
+    if (box) { box.focus(); return document.querySelectorAll('[data-message-author-role="assistant"]').length; }
+    return -1;
+  })()`);
+  if (before < 0) throw new Error('Sign in to ChatGPT in its embedded browser, then retry.');
+  if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT.');
+  chatGPTView.webContents.insertText(prompt);
+  const sent = await chatGPTView.webContents.executeJavaScript(`(() => {
+    const button = document.querySelector('button[data-testid="send-button"]');
+    if (button && !button.disabled) { button.click(); return true; }
+    return false;
+  })()`);
+  if (!sent) throw new Error('ChatGPT did not show its send control. Check the message and try again.');
+  const answer = await chatGPTView.webContents.executeJavaScript(`(async () => {
+    for (let i = 0; i < 240; i++) {
+      if (window.__XBA_PAUSED) return '';
+      const replies = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+      const newest = replies.at(-1);
+      const stop = document.querySelector('button[data-testid="stop-button"]');
+      if (replies.length > ${before} && newest?.innerText?.trim() && !stop) return newest.innerText.trim();
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    return '';
+  })()`);
+  if (!answer) throw new Error('ChatGPT did not return a completed reply in time.');
+  if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT.');
+  return answer;
+}
+ipcMain.handle('chatgpt:rephrase', async (_event, input) => {
+  if (agentPaused) throw new Error('Agent is paused. Resume it before using ChatGPT.');
+  const { tweet, reply, voice, context } = input || {};
+  if (typeof tweet !== 'string' || !tweet.trim() || tweet.length > 5000 || typeof reply !== 'string' || !reply.trim() || reply.length > 1000) {
+    throw new Error('A tweet and draft reply are required to rephrase.');
+  }
+  const stateRes = await fetch('http://127.0.0.1:8000/api/agent/state');
+  if ((await stateRes.json()).paused) { agentPaused = true; throw new Error('Emergency stop is active.'); }
+  const prompt = `Rewrite the draft as a natural reply to the X post. Improve the reading flow and keep the writer's voice. Preserve the point and factual meaning; do not add claims, personal experience, flattery, or a generic opening. Keep it to 40 words or fewer. Return only the revised reply, with no explanation.\n\nWRITING VOICE: ${typeof voice === 'string' ? voice.slice(0, 1000) : 'Natural, direct, and conversational.'}\n\nX POST: ${tweet.trim()}\n\n${typeof context === 'string' && context.trim() ? `RELEVANT CONTEXT: ${context.slice(0, 6000)}\n\n` : ''}DRAFT REPLY: ${reply.trim()}`;
+  return { reply: await sendChatGPTPrompt(prompt) };
+});
 ipcMain.handle('chatgpt:research', async (_event, { postId, prompt }) => {
   if (agentPaused) throw new Error('Agent is paused. Resume it before researching.');
   if (!Number.isInteger(postId) || typeof prompt !== 'string' || !prompt.trim()) throw new Error('Research request is incomplete');
@@ -179,34 +245,7 @@ ipcMain.handle('chatgpt:research', async (_event, { postId, prompt }) => {
   })()`);
   if (agentPaused) throw new Error('Emergency stop interrupted research.');
   if (!threadContext.length) throw new Error('Could not read the visible conversation. Check your X login and try again.');
-  await showChatGPT();
-  const researchPrompt = `${prompt}\n\nVISIBLE X THREAD CONTEXT:\n${JSON.stringify(threadContext)}`;
-  const before = await chatGPTView.webContents.executeJavaScript(`(() => {
-    const box = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-    if (box) { box.focus(); return document.querySelectorAll('[data-message-author-role="assistant"]').length; }
-    return -1;
-  })()`);
-  if (before < 0) throw new Error('Sign in to ChatGPT in its embedded browser, then retry this research.');
-  if (agentPaused) throw new Error('Emergency stop interrupted research.');
-  chatGPTView.webContents.insertText(researchPrompt);
-  const sent = await chatGPTView.webContents.executeJavaScript(`(() => {
-    const button = document.querySelector('button[data-testid="send-button"]');
-    if (button && !button.disabled) { button.click(); return true; }
-    return false;
-  })()`);
-  if (!sent) throw new Error('ChatGPT did not show its send control. Check the prompt and try again.');
-  const answer = await chatGPTView.webContents.executeJavaScript(`(async () => {
-    for (let i = 0; i < 240; i++) {
-      if (window.__XBA_PAUSED) return '';
-      const replies = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-      const newest = replies.at(-1);
-      const stop = document.querySelector('button[data-testid="stop-button"]');
-      if (replies.length > ${before} && newest?.innerText?.trim() && !stop) return newest.innerText.trim();
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    return '';
-  })()`);
-  if (!answer) throw new Error('ChatGPT did not return a completed draft in time');
+  const answer = await sendChatGPTPrompt(`${prompt}\n\nVISIBLE X THREAD CONTEXT:\n${JSON.stringify(threadContext)}`);
   if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT research.');
   return { answer, threadContext };
 });

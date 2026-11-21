@@ -12,10 +12,10 @@ python3 -m venv backend/.venv
 backend/.venv/bin/pip install -r backend/requirements.txt
 cp .env.example backend/.env
 # Set GEMINI_API_KEY in backend/.env. ChatGPT uses its browser session; no OpenAI API key is needed.
-npm run start
+npm run desktop
 ```
 
-This starts the React dashboard at `http://127.0.0.1:5173` and the API at `http://127.0.0.1:8000`. To run the desktop client after starting those services, use `npm run electron` in another terminal. Sign in yourself through **Open X** and **ChatGPT** in Electron; both sessions persist locally. In **Discover**, choose **Search X & research** to search your saved topics, or enter an optional keyword. The app searches X automatically, then **Research with ChatGPT → Draft with Gemini** opens the selected conversation and visible thread in the ChatGPT browser, collects a concise research note, and sends that note and the thread context to Gemini for scoring and drafting. No OpenAI API key is needed.
+This starts the React dashboard, local API, and Electron desktop app together. The browser-only dashboard at `http://127.0.0.1:5173` is a visual preview; X login and browser-based ChatGPT research require Electron. Sign in yourself through **Sign in to X** and **Sign in to ChatGPT** in Electron; each service has its own persistent browser session and account. In **Discover**, choose **Search X & research** to search your saved topics, or enter an optional keyword. The app searches X automatically, then **Research with ChatGPT → Draft with Gemini** opens the selected conversation and visible thread in the ChatGPT browser, collects a concise research note, and sends that note and the thread context to Gemini for scoring and drafting. A **Rephrase with ChatGPT** action can smooth the draft while preserving its point and your saved voice. No OpenAI API key is needed.
 
 Gemini needs `GEMINI_API_KEY` in `backend/.env`. Keys are only read by Python; never add them to `src/` or frontend build settings. ChatGPT research uses the visible browser session after you sign in normally.
 
