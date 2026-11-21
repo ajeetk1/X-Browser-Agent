@@ -3,24 +3,63 @@ const path = require('node:path');
 
 let window;
 let xView;
-let chatGPTView;
-let activeView = 'none';
+let activeView = 'x';
 let agentPaused = false;
+let xLoadPromise;
 function placeView() {
-  if (!window || !xView || !chatGPTView) return;
+  if (!window || !xView) return;
   const { width, height } = window.getContentBounds();
   const bounds = { x: Math.floor(width * 0.58), y: 0, width: Math.floor(width * 0.42), height };
   xView.setBounds(activeView === 'x' ? bounds : { x: 0, y: 0, width: 0, height: 0 });
-  chatGPTView.setBounds(activeView === 'chatgpt' ? bounds : { x: 0, y: 0, width: 0, height: 0 });
+}
+async function waitForXContent() {
+  return xView.webContents.executeJavaScript(`(async () => {
+    for (let i = 0; i < 24; i++) {
+      if (document.body?.innerText?.trim().length > 20) return true;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    return false;
+  })()`);
+}
+function showXLoadError(error) {
+  if (!xView || xView.webContents.isDestroyed()) return;
+  const message = String(error?.message || 'X could not be loaded').replace(/[&<>]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char]));
+  const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;background:#000;color:#fff;font:15px -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh;text-align:center}.box{max-width:340px;padding:28px}h1{font-size:24px}p{color:#aaa;line-height:1.5}button{border:0;border-radius:18px;padding:10px 18px;font-weight:600;cursor:pointer}</style><div class="box"><h1>X didn’t finish loading</h1><p>${message}</p><p>Check your internet connection, then click retry.</p><button onclick="location.href='https://x.com'">Retry X</button></div>`;
+  void xView.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(page)}`);
+}
+async function bestEffort(promise, label) {
+  await Promise.race([
+    promise.catch(error => console.warn(`${label} failed:`, error.message)),
+    new Promise(resolve => setTimeout(resolve, 5000)),
+  ]);
+}
+function loadXWithRecovery() {
+  if (xLoadPromise) return xLoadPromise;
+  xLoadPromise = (async () => {
+    await xView.webContents.loadURL('https://x.com');
+    if (await waitForXContent()) return;
+    console.warn('X loaded an empty shell. Clearing only X cache and service-worker storage, keeping sign-in cookies.');
+    await bestEffort(xView.webContents.session.clearCache(), 'X cache cleanup');
+    await bestEffort(xView.webContents.session.clearStorageData({ origin: 'https://x.com', storages: ['serviceworkers', 'cachestorage'] }), 'X service-worker cleanup');
+    await xView.webContents.loadURL('https://x.com');
+    if (!await waitForXContent()) throw new Error('X is still showing a blank loading screen. Check your connection to x.com and try again.');
+  })().finally(() => { xLoadPromise = undefined; });
+  return xLoadPromise;
 }
 function createWindow() {
   window = new BrowserWindow({ width: 1440, height: 960, minWidth: 850, minHeight: 650, backgroundColor: '#f7f8fa', webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false } });
   xView = new WebContentsView({ webPreferences: { partition: 'persist:x-browser-agent', contextIsolation: true, nodeIntegration: false, sandbox: true } });
-  chatGPTView = new WebContentsView({ webPreferences: { partition: 'persist:chatgpt-research', contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.contentView.addChildView(xView);
-  window.contentView.addChildView(chatGPTView);
-  xView.webContents.loadURL('https://x.com');
-  chatGPTView.webContents.loadURL('about:blank');
+  xView.webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+    if (isMainFrame) console.error(`X page load failed (${code}): ${description} — ${url}`);
+  });
+  xView.webContents.on('did-finish-load', () => {
+    xView.webContents.executeJavaScript(`({title:document.title,readyState:document.readyState,bodyTextLength:document.body?.innerText?.trim().length||0,hasMain:!!document.querySelector('main'),hasLogin:!!document.querySelector('[data-testid="loginButton"]'),articleCount:document.querySelectorAll('article').length})`)
+      .then(state => console.log('X page ready:', JSON.stringify(state)))
+      .catch(error => console.error('Could not inspect loaded X page:', error.message));
+  });
+  xView.webContents.on('render-process-gone', (_event, details) => console.error('X renderer exited:', JSON.stringify(details)));
+  void loadXWithRecovery().catch(error => { console.error('Could not load X:', error.message); showXLoadError(error); });
   placeView();
   void loadDashboard();
   window.on('resize', placeView);
@@ -51,7 +90,10 @@ ipcMain.handle('x-browser:open', async () => {
   if (!xView) throw new Error('X browser is not available');
   activeView = 'x';
   placeView();
-  if (xView.webContents.getURL() === 'about:blank') await xView.webContents.loadURL('https://x.com');
+  if (window && !window.isDestroyed()) { window.show(); window.focus(); }
+  try { await loadXWithRecovery(); }
+  catch (error) { showXLoadError(error); throw error; }
+  xView.webContents.focus();
   return true;
 });
 ipcMain.handle('x-browser:scan-visible-posts', async () => {
@@ -141,6 +183,7 @@ ipcMain.handle('x-browser:publish-approved', async (_event, suggestionId) => {
   if (agentPaused) throw new Error('Emergency stop stopped the reply before it was submitted.');
   xView.webContents.insertText(payload.text);
   const posted = await xView.webContents.executeJavaScript(`(async () => {
+    const expectedReply = ${JSON.stringify(payload.text)}.trim();
     for (let i = 0; i < 20; i++) {
       const button = document.querySelector('[data-testid="tweetButtonInline"]') || document.querySelector('[data-testid="tweetButton"]');
       if (window.__XBA_PAUSED) return false;
@@ -149,17 +192,26 @@ ipcMain.handle('x-browser:publish-approved', async (_event, suggestionId) => {
     }
     for (let i = 0; i < 24; i++) {
       const message = [...document.querySelectorAll('[role="alert"], [data-testid="toast"]')].map(e => e.innerText).join(' ');
+      const replyVisible = [...document.querySelectorAll('[data-testid="tweetText"]')].some(e => e.innerText.trim() === expectedReply);
       if (window.__XBA_PAUSED) return false;
-      if (/reply was sent|your reply was sent|posted/i.test(message)) return true;
+      if (/reply was sent|your reply was sent|posted/i.test(message) || replyVisible) return true;
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     return false;
   })()`);
   if (agentPaused) throw new Error('Emergency stop activated. Check X to see whether the reply was submitted.');
   if (!posted) throw new Error('X did not confirm the reply was posted. Check the conversation before trying again.');
-  const saved = await fetch(`http://127.0.0.1:8000/api/publishing/${suggestionId}/record`, { method: 'POST' });
-  const recorded = await saved.json().catch(() => ({}));
-  if (!saved.ok) throw new Error(recorded.detail || 'X confirmed the reply, but the local publishing record could not be updated');
+  let saved;
+  let recorded = {};
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      saved = await fetch(`http://127.0.0.1:8000/api/publishing/${suggestionId}/record`, { method: 'POST' });
+      recorded = await saved.json().catch(() => ({}));
+      if (saved.ok) break;
+    } catch (error) { recorded = { detail: error.message }; }
+    await new Promise(resolve => setTimeout(resolve, 400 * (attempt + 1)));
+  }
+  if (!saved?.ok) throw new Error(recorded.detail || 'X confirmed the reply, but the local publishing record could not be updated');
   return { published: true, count: recorded.count };
 });
 ipcMain.handle('x-browser:open-post', async (_event, url) => {
@@ -170,62 +222,11 @@ ipcMain.handle('x-browser:open-post', async (_event, url) => {
   placeView();
   return true;
 });
-async function showChatGPT() {
-  if (!chatGPTView) throw new Error('ChatGPT browser is not available');
-  activeView = 'chatgpt';
-  placeView();
-  if (chatGPTView.webContents.getURL() === 'about:blank') await chatGPTView.webContents.loadURL('https://chatgpt.com');
-}
-ipcMain.handle('chatgpt:open', async () => { await showChatGPT(); return true; });
-async function sendChatGPTPrompt(prompt) {
-  if (agentPaused) throw new Error('Agent is paused. Resume it before using ChatGPT.');
-  await showChatGPT();
-  const before = await chatGPTView.webContents.executeJavaScript(`(() => {
-    const box = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-    if (box) { box.focus(); return document.querySelectorAll('[data-message-author-role="assistant"]').length; }
-    return -1;
-  })()`);
-  if (before < 0) throw new Error('Sign in to ChatGPT in its embedded browser, then retry.');
-  if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT.');
-  chatGPTView.webContents.insertText(prompt);
-  const sent = await chatGPTView.webContents.executeJavaScript(`(() => {
-    const button = document.querySelector('button[data-testid="send-button"]');
-    if (button && !button.disabled) { button.click(); return true; }
-    return false;
-  })()`);
-  if (!sent) throw new Error('ChatGPT did not show its send control. Check the message and try again.');
-  const answer = await chatGPTView.webContents.executeJavaScript(`(async () => {
-    for (let i = 0; i < 240; i++) {
-      if (window.__XBA_PAUSED) return '';
-      const replies = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-      const newest = replies.at(-1);
-      const stop = document.querySelector('button[data-testid="stop-button"]');
-      if (replies.length > ${before} && newest?.innerText?.trim() && !stop) return newest.innerText.trim();
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    return '';
-  })()`);
-  if (!answer) throw new Error('ChatGPT did not return a completed reply in time.');
-  if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT.');
-  return answer;
-}
-ipcMain.handle('chatgpt:rephrase', async (_event, input) => {
-  if (agentPaused) throw new Error('Agent is paused. Resume it before using ChatGPT.');
-  const { tweet, reply, voice, context } = input || {};
-  if (typeof tweet !== 'string' || !tweet.trim() || tweet.length > 5000 || typeof reply !== 'string' || !reply.trim() || reply.length > 1000) {
-    throw new Error('A tweet and draft reply are required to rephrase.');
-  }
+ipcMain.handle('x-browser:read-thread', async (_event, { postId }) => {
+  if (agentPaused) throw new Error('Agent is paused. Resume it before researching.');
+  if (!Number.isInteger(postId)) throw new Error('Research request is incomplete');
   const stateRes = await fetch('http://127.0.0.1:8000/api/agent/state');
   if ((await stateRes.json()).paused) { agentPaused = true; throw new Error('Emergency stop is active.'); }
-  const prompt = `Rewrite the draft as a natural reply to the X post. Improve the reading flow and keep the writer's voice. Preserve the point and factual meaning; do not add claims, personal experience, flattery, or a generic opening. Keep it to 40 words or fewer. Return only the revised reply, with no explanation.\n\nWRITING VOICE: ${typeof voice === 'string' ? voice.slice(0, 1000) : 'Natural, direct, and conversational.'}\n\nX POST: ${tweet.trim()}\n\n${typeof context === 'string' && context.trim() ? `RELEVANT CONTEXT: ${context.slice(0, 6000)}\n\n` : ''}DRAFT REPLY: ${reply.trim()}`;
-  return { reply: await sendChatGPTPrompt(prompt) };
-});
-ipcMain.handle('chatgpt:research', async (_event, { postId, prompt }) => {
-  if (agentPaused) throw new Error('Agent is paused. Resume it before researching.');
-  if (!Number.isInteger(postId) || typeof prompt !== 'string' || !prompt.trim()) throw new Error('Research request is incomplete');
-  const stateRes = await fetch('http://127.0.0.1:8000/api/agent/state');
-  const state = await stateRes.json();
-  if (state.paused) { agentPaused = true; throw new Error('Agent is paused. Resume it before researching.'); }
   const postRes = await fetch(`http://127.0.0.1:8000/api/posts/${postId}`);
   const post = await postRes.json().catch(() => ({}));
   if (!postRes.ok) throw new Error(post.detail || 'Could not load the conversation');
@@ -245,22 +246,32 @@ ipcMain.handle('chatgpt:research', async (_event, { postId, prompt }) => {
   })()`);
   if (agentPaused) throw new Error('Emergency stop interrupted research.');
   if (!threadContext.length) throw new Error('Could not read the visible conversation. Check your X login and try again.');
-  const answer = await sendChatGPTPrompt(`${prompt}\n\nVISIBLE X THREAD CONTEXT:\n${JSON.stringify(threadContext)}`);
-  if (agentPaused) throw new Error('Emergency stop interrupted ChatGPT research.');
-  return { answer, threadContext };
+  return { threadContext };
 });
 ipcMain.handle('agent:pause', () => {
   agentPaused = true;
   if (xView && !xView.webContents.isDestroyed()) { xView.webContents.executeJavaScript('window.__XBA_PAUSED = true').catch(() => {}); xView.webContents.stop(); }
-  if (chatGPTView && !chatGPTView.webContents.isDestroyed()) { chatGPTView.webContents.executeJavaScript('window.__XBA_PAUSED = true').catch(() => {}); chatGPTView.webContents.stop(); }
   return { paused: true };
 });
 ipcMain.handle('agent:resume', () => {
   agentPaused = false;
   if (xView && !xView.webContents.isDestroyed()) xView.webContents.executeJavaScript('window.__XBA_PAUSED = false').catch(() => {});
-  if (chatGPTView && !chatGPTView.webContents.isDestroyed()) chatGPTView.webContents.executeJavaScript('window.__XBA_PAUSED = false').catch(() => {});
   return { paused: false };
 });
-app.whenReady().then(createWindow);
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!window || window.isDestroyed()) return createWindow();
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    activeView = 'x';
+    placeView();
+    void loadXWithRecovery().catch(showXLoadError);
+  });
+  app.whenReady().then(createWindow);
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+}

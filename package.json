@@ -8,8 +8,11 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "electron": "electron .",
-    "start": "concurrently -k \"npm:dev\" \"npm:backend\"",
-    "desktop": "concurrently -k \"npm:dev\" \"npm:backend\" \"npm:electron\"",
+    "start": "node scripts/desktop.cjs",
+    "desktop": "node scripts/desktop.cjs",
+    "local-services": "node scripts/local-services.cjs",
+    "autostart:install": "node scripts/autostart.cjs install",
+    "autostart:uninstall": "node scripts/autostart.cjs uninstall",
     "backend": "cd backend && if [ -x .venv/bin/uvicorn ]; then .venv/bin/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000; else python3 -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000; fi"
   },
   "dependencies": { "lucide-react": "^0.468.0", "react": "^18.3.1", "react-dom": "^18.3.1" },
